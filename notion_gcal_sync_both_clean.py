@@ -44,6 +44,19 @@ def safe_get_text(prop, key="rich_text", default=""):
         log(f"[경고] safe_get_text 예외: {e}")
     return default
 
+def safe_get_select(property_value, field_name):
+    """Notion select 타입의 값을 안전하게 가져오는 함수"""
+    try:
+        if not property_value or field_name not in property_value:
+            return ""
+        select_value = property_value[field_name]
+        if not select_value:
+            return ""
+        return select_value.get("name", "")
+    except Exception as e:
+        log(f"⚠️ {field_name} 필드 읽기 실패: {e}")
+        return ""
+
 def get_google_service():
     try:
         log("🧪 get_google_service 진입")
@@ -72,124 +85,118 @@ def get_notion_pages():
     res = requests.post(url, headers=headers)
     return res.json().get("results", [])
 
-def notion_to_google(service):
-    pages = get_notion_pages()
-    log(f"📄 Notion 페이지 {len(pages)}개 확인됨")
-
-    for page in pages:
-        props = page["properties"]
-        title = safe_get_text(props["이름"], "title", "(제목 없음)")
-        log(f"🔍 처리 중인 이벤트: {title}")
-
-        # 애플id가 공란인 경우 (Notion에서 작성된 새 일정)
-        event_id = safe_get_text(props.get("애플id", {}), "rich_text", "")
-        if not event_id:
-            log(f"📝 Notion에서 작성된 새 일정 발견: {title}")
-            
-            # 상태 확인
-            상태 = props["상태"]["select"]["name"] if props["상태"]["select"] else ""
-            if 상태 != "등록":  # "등록" 상태인 경우만 처리
-                log(f"⏭️ 상태 '{상태}'로 인해 건너뛰기: {title}")
-                continue
-
-            # Google Calendar에 등록
-            유형 = safe_select(props.get("유형"), "개인")
-            log(f"📁 유형: {유형}")
-            cal_id = calendar_id_map.get(유형, calendar_id_map["개인"])
-            
-            start = props["일시"]["date"]["start"]
-            end = props["일시"]["date"]["end"] or start
-            
-            try:
-                # Google Calendar에 이벤트 생성
-                log(f"📤 Google Calendar에 새 일정 생성 중: {title}")
-                event = service.events().insert(
-                    calendarId=cal_id,
-                    body={
-                        "summary": title,
-                        "start": {"dateTime": start, "timeZone": "Asia/Seoul"},
-                        "end": {"dateTime": end, "timeZone": "Asia/Seoul"}
-                    }
-                ).execute()
-                
-                # 생성된 이벤트의 ID와 URL만 Notion에 업데이트 (상태는 변경하지 않음)
-                log(f"🔄 Notion에 Google Calendar 정보 업데이트 중: {title}")
-                requests.patch(
-                    f"https://api.notion.com/v1/pages/{page['id']}",
-                    headers={
-                        "Authorization": f"Bearer {NOTION_TOKEN}",
-                        "Notion-Version": NOTION_VERSION,
-                        "Content-Type": "application/json"
-                    },
-                    data=json.dumps({
-                        "properties": {
-                            "애플id": {"rich_text": [{"text": {"content": event["id"]}}]},
-                            "URL": {"url": event.get("htmlLink", "")}
-                            # 상태는 변경하지 않음 - "등록" 상태 유지
-                        }
-                    })
-                )
-                log(f"✅ Google Calendar 등록 및 Notion 업데이트 완료: {title}")
-                
-            except Exception as e:
-                log(f"❌ Google Calendar 등록 실패: {e}")
-                continue
-
-        # 기존 로직 (애플id가 있는 경우의 처리)
+def update_notion_event(page_id, event_id, html_link):
+    """Notion 이벤트의 애플id와 URL을 업데이트하는 함수"""
+    try:
+        response = requests.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers={
+                "Authorization": f"Bearer {NOTION_TOKEN}",
+                "Notion-Version": NOTION_VERSION,
+                "Content-Type": "application/json"
+            },
+            data=json.dumps({
+                "properties": {
+                    "애플id": {"rich_text": [{"text": {"content": event_id}}]},
+                    "URL": {"url": html_link}
+                }
+            })
+        )
+        
+        if response.status_code == 200:
+            log(f"✅ Notion 이벤트 업데이트 완료 - ID: {event_id}")
+            return True
         else:
-            상태 = props["상태"]["select"]["name"] if props["상태"]["select"] else ""
-            if 상태 not in ["등록", "수정"]:
+            log(f"❌ Notion 이벤트 업데이트 실패: {response.text}")
+            return False
+            
+    except Exception as e:
+        log(f"❌ Notion 이벤트 업데이트 중 오류 발생: {e}")
+        return False
+
+def notion_to_google(service):
+    notion_data = get_notion_pages()
+    
+    for page in notion_data:
+        try:
+            # select 타입의 값을 가져오는 방식 수정
+            event_type = safe_get_select(page["properties"]["유형"], "select")
+            if not event_type:
+                log(f"⚠️ 유형이 지정되지 않은 이벤트 건너뛰기 - 제목: {safe_get_text(page['properties']['이름'], 'title', '')}")
                 continue
-
-            유형 = safe_select(props.get("유형"), "개인")
-            cal_id = calendar_id_map.get(유형, calendar_id_map["개인"])
-            start = props["일시"]["date"]["start"]
-            end = props["일시"]["date"]["end"] or start
-            page_id = page["id"]
-
-            if 상태 == "등록":
-                log(f"📤 Google 일정 생성 중: {title} ({유형})")
-                try:
-                    event = service.events().insert(
-                        calendarId=cal_id,
-                        body={
-                            "summary": title,
-                            "start": {"dateTime": start, "timeZone": "Asia/Seoul"},
-                            "end": {"dateTime": end, "timeZone": "Asia/Seoul"}
-                        }
-                    ).execute()
+                
+            calendar_id = calendar_id_map.get(event_type)
+            if not calendar_id:
+                log(f"⚠️ 알 수 없는 캘린더 유형: {event_type}")
+                continue
+                
+            log(f"📅 {event_type} 캘린더 처리 중...")
+            
+            # 필수 필드 검증
+            title = safe_get_text(page["properties"]["이름"], "title", "")
+            if not title:
+                log(f"⚠️ 제목이 없는 이벤트 건너뛰기")
+                continue
+                
+            start_time = page["properties"]["일시"]["date"]["start"]
+            if not start_time:
+                log(f"⚠️ 시작 시간이 없는 이벤트 건너뛰기: {title}")
+                continue
+            
+            # 애플id가 이미 있는 경우 건너뛰기
+            existing_event_id = safe_get_text(page["properties"].get("애플id", {}), "rich_text", "")
+            if existing_event_id:
+                log(f"⏭️ 이미 Google Calendar에 등록된 이벤트 건너뛰기: {title} (ID: {existing_event_id})")
+                continue
+            
+            # 시간 형식 통일
+            if isinstance(start_time, str):
+                if 'T' not in start_time:  # 날짜만 있는 경우
+                    start_time = f"{start_time}T00:00:00+09:00"
+                elif not start_time.endswith('Z') and '+' not in start_time:
+                    start_time = f"{start_time}+09:00"
                     
-                    # 애플id와 URL만 업데이트하고 상태는 변경하지 않음
-                    requests.patch(
-                        f"https://api.notion.com/v1/pages/{page_id}",
-                        headers={
-                            "Authorization": f"Bearer {NOTION_TOKEN}",
-                            "Notion-Version": NOTION_VERSION,
-                            "Content-Type": "application/json"
-                        },
-                        data=json.dumps({
-                            "properties": {
-                                "애플id": {"rich_text": [{"text": {"content": event["id"]}}]},
-                                "URL": {"url": event.get("htmlLink", "")}
-                                # 상태는 변경하지 않음 - "등록" 상태 유지
-                            }
-                        })
-                    )
-                    log("✅ Google 일정 생성 완료")
-                except Exception as e:
-                    log(f"❌ Google 일정 생성 실패: {e}")
-                    
-            elif 상태 == "수정" and event_id:
-                log(f"🔧 Google 일정 수정 중: {title}")
-                try:
-                    event = service.events().get(calendarId=cal_id, eventId=event_id).execute()
-                    event["summary"] = title
-                    event["start"]["dateTime"] = start
-                    event["end"]["dateTime"] = end
-                    service.events().update(calendarId=cal_id, eventId=event_id, body=event).execute()
-                    log("✅ Google 일정 수정 완료")
-                except Exception as e:
-                    log(f"❌ Google 일정 수정 실패: {e}")
+            end_time = page["properties"]["일시"]["date"]["end"]
+            if not end_time:
+                # 종료 시간이 없는 경우 시작 시간 + 1시간으로 설정
+                if isinstance(start_time, str):
+                    start_dt = datetime.datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                    end_dt = start_dt + datetime.timedelta(hours=1)
+                    end_time = end_dt.isoformat()
+            
+            # 이벤트 데이터 준비
+            event = {
+                'summary': title,
+                'start': {'dateTime' if 'T' in start_time else 'date': start_time},
+                'end': {'dateTime' if 'T' in end_time else 'date': end_time},
+                'status': 'confirmed'
+            }
+            
+            # Google Calendar에 이벤트 생성
+            log(f"📤 Google Calendar에 새 일정 생성 중: {title}")
+            created_event = service.events().insert(
+                calendarId=calendar_id,
+                body=event
+            ).execute()
+            
+            if created_event and 'id' in created_event:
+                # 생성된 이벤트의 ID와 URL을 Notion에 업데이트
+                event_id = created_event['id']
+                html_link = created_event.get('htmlLink', '')
+                
+                if update_notion_event(page["id"], event_id, html_link):
+                    log(f"✅ 동기화 완료 - 제목: {title}")
+                    log(f"  - Google Calendar ID: {event_id}")
+                    log(f"  - URL: {html_link}")
+                else:
+                    log(f"⚠️ Google Calendar 등록은 완료되었으나 Notion 업데이트 실패 - 제목: {title}")
+            else:
+                log(f"❌ Google Calendar 이벤트 생성 실패 - 제목: {title}")
+                
+        except Exception as e:
+            log(f"❌ Google Calendar 등록 실패: {e}")
+            log(f"  - 이벤트 데이터: {json.dumps(event, ensure_ascii=False)}")
+            continue
 
 def google_to_notion(service):
     notion_data = get_notion_pages()
@@ -201,30 +208,35 @@ def google_to_notion(service):
         event_id = safe_get_text(props.get("애플id", {}), "rich_text", "")
         if event_id:
             notion_events[event_id] = page
-            log(f"📋 Notion에 존재하는 이벤트 - ID: {event_id}")
+            log(f"📋 Notion에 존재하는 이벤트 - ID: {event_id}, 제목: {safe_get_text(props['이름'], 'title', '')}")
     
     log(f"📊 Notion에 존재하는 이벤트 수: {len(notion_events)}개")
     
-    # 2. 날짜 범위 설정 - 오늘부터 6개월
+    # 2. 날짜 범위 설정 - 6개월 (timezone-aware)
     now = datetime.datetime.now(datetime.timezone.utc)
-    # 오늘 자정부터 시작
     today_start = datetime.datetime(now.year, now.month, now.day, tzinfo=datetime.timezone.utc)
-    # 6개월 후 자정까지
-    six_months_later = today_start + datetime.timedelta(days=180)  # 6개월 = 약 180일
+    six_months_later = today_start + datetime.timedelta(days=180)
     
     log(f"📅 동기화 기간: {today_start.strftime('%Y-%m-%d')} ~ {six_months_later.strftime('%Y-%m-%d')}")
     
-    processed_events = set()
-    
     for cal_name, cal_id in calendar_id_map.items():
-        log(f"📅 {cal_name} 캘린더 동기화 시작")
+        log(f"\n📅 {cal_name} 캘린더 동기화 시작")
+        log(f"🔍 캘린더 ID: {cal_id}")
         
         try:
-            # 3. Google Calendar 이벤트 가져오기 - 6개월 범위로 수정
+            # 캘린더 존재 여부 확인
+            try:
+                calendar = service.calendars().get(calendarId=cal_id).execute()
+                log(f"✅ 캘린더 접근 가능: {calendar.get('summary', cal_name)}")
+            except Exception as e:
+                log(f"❌ 캘린더 접근 실패: {e}")
+                continue
+            
+            # 이벤트 가져오기
             events = service.events().list(
                 calendarId=cal_id,
-                timeMin=today_start.isoformat(),  # 오늘 자정부터
-                timeMax=six_months_later.isoformat(),  # 6개월 후 자정까지
+                timeMin=today_start.isoformat(),
+                timeMax=six_months_later.isoformat(),
                 maxResults=100,
                 singleEvents=True,
                 orderBy="startTime"
@@ -232,48 +244,89 @@ def google_to_notion(service):
             
             log(f"📥 {cal_name} 캘린더에서 {len(events)}개의 이벤트 가져옴")
             
-            # 4. 이벤트 처리 전에 중복 제거 및 날짜 범위 재확인
+            # 이벤트 상세 로깅
+            if len(events) > 0:
+                log(f"📋 {cal_name} 캘린더 이벤트 목록:")
+                for ev in events:
+                    title = ev.get("summary", "(제목 없음)")
+                    start = ev["start"].get("dateTime", ev["start"].get("date"))
+                    event_id = ev["id"]
+                    log(f"  - {title} (시작: {start}, ID: {event_id})")
+            
+            # 이벤트 처리 전에 중복 제거
             unique_events = {}
             for ev in events:
+                title = ev.get('summary', '')
                 start_time = ev['start'].get('dateTime', ev['start'].get('date'))
-                # 시작 시간이 문자열인 경우 datetime 객체로 변환
-                if isinstance(start_time, str):
-                    start_time = datetime.datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                event_id = ev['id']
+                key = f"{title}_{start_time}"
                 
-                # 날짜 범위 재확인
-                if start_time < today_start or start_time >= six_months_later:
-                    log(f"⏭️ 범위를 벗어난 이벤트 제외: {ev.get('summary', '')} (시작: {start_time})")
-                    continue
-                
-                # 제목과 시작 시간으로 중복 체크
-                key = f"{ev.get('summary', '')}_{start_time.isoformat()}"
                 if key not in unique_events:
                     unique_events[key] = ev
-                    log(f"📌 고유한 이벤트 추가: {ev.get('summary', '')} (시작: {start_time})")
+                    log(f"📌 고유한 이벤트 추가: {title} (시작: {start_time}, ID: {event_id})")
                 else:
-                    log(f"⚠️ 중복 이벤트 발견: {ev.get('summary', '')} (시작: {start_time})")
+                    log(f"⚠️ 중복 이벤트 발견: {title} (시작: {start_time}, ID: {event_id})")
             
-            log(f"🔄 중복 제거 및 범위 확인 후 {len(unique_events)}개의 이벤트 남음")
+            log(f"🔄 중복 제거 후 {len(unique_events)}개의 고유한 이벤트 남음")
             
-            # 5. 고유한 이벤트만 처리
             for ev in unique_events.values():
                 google_event_id = ev["id"]
                 title = ev.get("summary", "(제목 없음)")
-                start = ev["start"].get("dateTime", ev["start"].get("date"))
                 
-                # 이미 Notion에 있는 이벤트는 건너뛰기
+                # Google Calendar ID로 중복 체크
                 if google_event_id in notion_events:
-                    log(f"⏭️ 이미 Notion에 존재하는 이벤트 건너뛰기: {title}")
+                    log(f"⏭️ 이미 Notion에 존재하는 이벤트 건너뛰기 - 제목: {title}, ID: {google_event_id}")
                     continue
                 
-                # 이번 실행에서 이미 처리한 이벤트는 건너뛰기
-                event_key = f"{title}_{start}"
-                if event_key in processed_events:
-                    log(f"⏭️ 이번 실행에서 이미 처리한 이벤트 건너뛰기: {title}")
+                # 시작 시간을 timezone-aware datetime으로 변환
+                start_time = ev["start"].get("dateTime", ev["start"].get("date"))
+                if isinstance(start_time, str):
+                    if start_time.endswith('Z'):
+                        start_time = datetime.datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                    else:
+                        start_time = datetime.datetime.fromisoformat(start_time)
+                
+                if isinstance(start_time, str) and 'T' not in start_time:
+                    start_time = datetime.datetime.fromisoformat(start_time + 'T00:00:00+00:00')
+                
+                # 종료 시간도 같은 방식으로 처리
+                end_time = ev["end"].get("dateTime", ev["end"].get("date"))
+                if isinstance(end_time, str):
+                    if end_time.endswith('Z'):
+                        end_time = datetime.datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+                    else:
+                        end_time = datetime.datetime.fromisoformat(end_time)
+                
+                if isinstance(end_time, str) and 'T' not in end_time:
+                    end_time = datetime.datetime.fromisoformat(end_time + 'T00:00:00+00:00')
+                
+                # 제목과 시작 시간으로 추가 중복 체크
+                event_key = f"{title}_{start_time.isoformat()}"
+                
+                # Notion의 모든 이벤트를 검사하여 제목과 시작 시간이 같은 이벤트가 있는지 확인
+                is_duplicate = False
+                for existing_page in notion_data:
+                    existing_title = safe_get_text(existing_page["properties"]["이름"], "title", "")
+                    existing_start = existing_page["properties"]["일시"]["date"]["start"]
+                    existing_id = safe_get_text(existing_page["properties"].get("애플id", {}), "rich_text", "")
+                    
+                    if isinstance(existing_start, str):
+                        if existing_start.endswith('Z'):
+                            existing_start = datetime.datetime.fromisoformat(existing_start.replace('Z', '+00:00'))
+                        else:
+                            existing_start = datetime.datetime.fromisoformat(existing_start)
+                    
+                    if existing_title == title and existing_start == start_time:
+                        log(f"⚠️ 제목과 시작 시간이 같은 이벤트 발견 - 제목: {title}, 시작: {start_time}, 기존 ID: {existing_id}, 새 ID: {google_event_id}")
+                        is_duplicate = True
+                        break
+                
+                if is_duplicate:
+                    log(f"⏭️ 중복 이벤트 건너뛰기 (제목/시간 중복) - 제목: {title}, ID: {google_event_id}")
                     continue
                 
                 # 새 이벤트 생성
-                log(f"🔍 새 이벤트 생성: {title}")
+                log(f"🔍 새 이벤트 생성 시도 - 제목: {title}, ID: {google_event_id}")
                 try:
                     response = requests.post(
                         f"https://api.notion.com/v1/pages",
@@ -286,7 +339,7 @@ def google_to_notion(service):
                             "parent": {"database_id": DATABASE_ID},
                             "properties": {
                                 "이름": {"title": [{"text": {"content": title}}]},
-                                "일시": {"date": {"start": start, "end": ev["end"].get("dateTime", ev["end"].get("date"))}},
+                                "일시": {"date": {"start": start_time.isoformat(), "end": end_time.isoformat()}},
                                 "URL": {"url": ev.get("htmlLink", "")},
                                 "유형": {"select": {"name": cal_name}},
                                 "애플id": {"rich_text": [{"text": {"content": google_event_id}}]},
@@ -296,20 +349,19 @@ def google_to_notion(service):
                     )
                     
                     if response.status_code == 200:
-                        log(f"✅ 새 이벤트 생성 완료: {title}")
+                        log(f"✅ 새 이벤트 생성 완료 - 제목: {title}, ID: {google_event_id}")
                         notion_events[google_event_id] = response.json()
-                        processed_events.add(event_key)
                     else:
-                        log(f"❌ 이벤트 생성 실패: {response.text}")
+                        log(f"❌ 이벤트 생성 실패 - 제목: {title}, ID: {google_event_id}, 오류: {response.text}")
                         
                 except Exception as e:
-                    log(f"❌ 이벤트 생성 중 오류 발생: {e}")
+                    log(f"❌ 이벤트 생성 중 오류 발생 - 제목: {title}, ID: {google_event_id}, 오류: {e}")
                     
         except Exception as e:
             log(f"❌ {cal_name} 캘린더 처리 중 오류 발생: {e}")
             continue
     
-    log(f"📊 이번 실행에서 처리된 총 이벤트 수: {len(processed_events)}개")
+    log(f"\n📊 처리 완료 - Notion에 존재하는 총 이벤트 수: {len(notion_events)}개")
 
 def main():
     try:
